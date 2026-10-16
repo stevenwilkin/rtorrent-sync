@@ -12,25 +12,34 @@ import (
 )
 
 var (
-	titleStyle       = lipgloss.NewStyle().Bold(true).MarginBottom(1)
-	cursorStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("212")).Bold(true)
-	highlightedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("0")).Background(lipgloss.Color("214"))
-	helpStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("241")).MarginTop(1)
+	titleStyle  = lipgloss.NewStyle().Bold(true).MarginBottom(1)
+	cursorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("212")).Bold(true)
+	queuedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("0")).Background(lipgloss.Color("214"))
+	helpStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("241")).MarginTop(1)
+	errorStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).MarginTop(1)
 )
 
 type torrentsMsg []string
 type errMsg error
 
+// queuedMsg reports the result of queueing a download.
+type queuedMsg struct {
+	name string
+	err  error
+}
+
 type model struct {
-	addr        string
-	torrents    []string
-	highlighted map[int]bool
-	cursor      int
-	offset      int // index of the first visible row
-	width       int // terminal width
-	height      int // terminal height
-	loading     bool
-	err         error
+	addr       string
+	downloader downloader
+	torrents   []string
+	queued     map[string]bool // keyed by name so it survives a refresh
+	cursor     int
+	offset     int // index of the first visible row
+	width      int // terminal width
+	height     int // terminal height
+	loading    bool
+	status     string // last action, shown in place of the help line
+	err        error
 }
 
 func fetchTorrents(addr string) tea.Cmd {
@@ -40,6 +49,12 @@ func fetchTorrents(addr string) tea.Cmd {
 			return errMsg(err)
 		}
 		return torrentsMsg(names)
+	}
+}
+
+func queueDownload(d downloader, name string) tea.Cmd {
+	return func() tea.Msg {
+		return queuedMsg{name: name, err: d.queue(name)}
 	}
 }
 
@@ -88,7 +103,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.loading = false
 		m.err = msg
 
+	case queuedMsg:
+		if msg.err != nil {
+			delete(m.queued, msg.name)
+			m.err = fmt.Errorf("queueing %s: %w", msg.name, msg.err)
+		} else {
+			m.status = "Queued " + msg.name
+		}
+
 	case tea.KeyMsg:
+		m.status = ""
+		m.err = nil
 		switch msg.String() {
 		case "q", "ctrl+c", "esc":
 			return m, tea.Quit
@@ -105,13 +130,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "end", "G":
 			m.moveCursor(len(m.torrents))
 		case "enter":
-			if len(m.torrents) > 0 {
-				m.highlighted[m.cursor] = !m.highlighted[m.cursor]
+			if len(m.torrents) == 0 {
+				break
 			}
+			name := m.torrents[m.cursor]
+			if m.queued[name] {
+				m.status = "Already queued " + name
+				break
+			}
+			m.queued[name] = true
+			return m, queueDownload(m.downloader, name)
 		case "r":
 			m.loading = true
-			m.err = nil
-			m.highlighted = map[int]bool{}
 			return m, fetchTorrents(m.addr)
 		}
 	}
@@ -127,10 +157,6 @@ func (m model) View() string {
 	}
 	b.WriteString(titleStyle.Render(title) + "\n")
 
-	if m.err != nil {
-		b.WriteString(fmt.Sprintf("Error: %v\n", m.err))
-	}
-
 	end := min(m.offset+m.visibleRows(), len(m.torrents))
 	for i := m.offset; i < end; i++ {
 		name := m.torrents[i]
@@ -138,8 +164,8 @@ func (m model) View() string {
 			// Truncate so long names don't wrap and throw off scrolling.
 			name = ansi.Truncate(name, m.width-2, "…")
 		}
-		if m.highlighted[i] {
-			name = highlightedStyle.Render(name)
+		if m.queued[m.torrents[i]] {
+			name = queuedStyle.Render(name)
 		}
 		if i == m.cursor {
 			b.WriteString(cursorStyle.Render("> ") + name + "\n")
@@ -148,15 +174,28 @@ func (m model) View() string {
 		}
 	}
 
-	b.WriteString(helpStyle.Render("↑/↓ move • enter highlight • r refresh • q quit"))
+	footer, style := "↑/↓ move • enter queue download • r refresh • q quit", helpStyle
+	if m.err != nil {
+		footer, style = "Error: "+m.err.Error(), errorStyle
+	} else if m.status != "" {
+		footer = m.status
+	}
+	if m.width > 0 {
+		footer = ansi.Truncate(footer, m.width, "…")
+	}
+	b.WriteString(style.Render(footer))
 	return b.String()
 }
 
 func main() {
 	addr := flag.String("addr", "localhost:1234", "rtorrent SCGI address")
+	var d downloader
+	flag.StringVar(&d.host, "host", "btc", "ssh host rtorrent runs on")
+	flag.StringVar(&d.dir, "dir", "torrents", "rtorrent download directory on host")
+	flag.StringVar(&d.dest, "dest", ".", "local download directory")
 	flag.Parse()
 
-	m := model{addr: *addr, highlighted: map[int]bool{}, loading: true}
+	m := model{addr: *addr, downloader: d, queued: map[string]bool{}, loading: true}
 	if _, err := tea.NewProgram(m, tea.WithAltScreen()).Run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
