@@ -1,122 +1,164 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
-	"encoding/xml"
 	"flag"
 	"fmt"
-	"io"
-	"net"
-	"net/textproto"
 	"os"
-	"strconv"
 	"strings"
-	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
-type value struct {
-	String *string  `xml:"string"`
-	Int    *string  `xml:"int"`
-	I4     *string  `xml:"i4"`
-	I8     *string  `xml:"i8"`
-	Array  *[]value `xml:"array>data>value"`
-	Chars  string   `xml:",chardata"`
+var (
+	titleStyle       = lipgloss.NewStyle().Bold(true).MarginBottom(1)
+	cursorStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("212")).Bold(true)
+	highlightedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("0")).Background(lipgloss.Color("214"))
+	helpStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("241")).MarginTop(1)
+)
+
+type torrentsMsg []string
+type errMsg error
+
+type model struct {
+	addr        string
+	torrents    []string
+	highlighted map[int]bool
+	cursor      int
+	offset      int // index of the first visible row
+	width       int // terminal width
+	height      int // terminal height
+	loading     bool
+	err         error
 }
 
-type methodResponse struct {
-	Params []value `xml:"params>param>value"`
-	Fault  *struct {
-		Members []struct {
-			Name  string `xml:"name"`
-			Value value  `xml:"value"`
-		} `xml:"value>struct>member"`
-	} `xml:"fault"`
-}
-
-func (v value) str() string {
-	switch {
-	case v.String != nil:
-		return *v.String
-	case v.Int != nil:
-		return *v.Int
-	case v.I4 != nil:
-		return *v.I4
-	case v.I8 != nil:
-		return *v.I8
-	}
-	// A <value> with no type element is a string.
-	return v.Chars
-}
-
-// call performs an XML-RPC call over SCGI and returns the first result param.
-func call(addr, method string, params ...string) (value, error) {
-	var body bytes.Buffer
-	body.WriteString(`<?xml version="1.0"?><methodCall><methodName>`)
-	xml.EscapeText(&body, []byte(method))
-	body.WriteString(`</methodName><params>`)
-	for _, p := range params {
-		body.WriteString(`<param><value><string>`)
-		xml.EscapeText(&body, []byte(p))
-		body.WriteString(`</string></value></param>`)
-	}
-	body.WriteString(`</params></methodCall>`)
-
-	conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
-	if err != nil {
-		return value{}, err
-	}
-	defer conn.Close()
-
-	// SCGI request: netstring-encoded headers followed by the body.
-	headers := "CONTENT_LENGTH\x00" + strconv.Itoa(body.Len()) + "\x00SCGI\x001\x00"
-	req := strconv.Itoa(len(headers)) + ":" + headers + "," + body.String()
-	if _, err := io.WriteString(conn, req); err != nil {
-		return value{}, err
-	}
-
-	// SCGI response: CGI-style headers, blank line, then the XML body.
-	r := bufio.NewReader(conn)
-	if _, err := textproto.NewReader(r).ReadMIMEHeader(); err != nil {
-		return value{}, fmt.Errorf("reading response headers: %w", err)
-	}
-
-	var resp methodResponse
-	if err := xml.NewDecoder(r).Decode(&resp); err != nil {
-		return value{}, fmt.Errorf("decoding response: %w", err)
-	}
-	if resp.Fault != nil {
-		var parts []string
-		for _, m := range resp.Fault.Members {
-			parts = append(parts, m.Name+"="+m.Value.str())
+func fetchTorrents(addr string) tea.Cmd {
+	return func() tea.Msg {
+		names, err := completedTorrents(addr)
+		if err != nil {
+			return errMsg(err)
 		}
-		return value{}, fmt.Errorf("fault: %s", strings.Join(parts, ", "))
+		return torrentsMsg(names)
 	}
-	if len(resp.Params) == 0 {
-		return value{}, fmt.Errorf("empty response")
+}
+
+func (m model) Init() tea.Cmd {
+	return fetchTorrents(m.addr)
+}
+
+// visibleRows is how many list rows fit between the title and help lines.
+func (m model) visibleRows() int {
+	return max(m.height-4, 1)
+}
+
+func (m *model) moveCursor(delta int) {
+	if len(m.torrents) == 0 {
+		return
 	}
-	return resp.Params[0], nil
+	m.cursor = min(max(m.cursor+delta, 0), len(m.torrents)-1)
+	m.clampOffset()
+}
+
+// clampOffset scrolls the view so the cursor stays on screen.
+func (m *model) clampOffset() {
+	rows := m.visibleRows()
+	if m.cursor < m.offset {
+		m.offset = m.cursor
+	} else if m.cursor >= m.offset+rows {
+		m.offset = m.cursor - rows + 1
+	}
+	m.offset = max(min(m.offset, len(m.torrents)-rows), 0)
+}
+
+func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		m.clampOffset()
+
+	case torrentsMsg:
+		m.loading = false
+		m.torrents = msg
+		m.cursor = min(m.cursor, max(len(m.torrents)-1, 0))
+		m.clampOffset()
+
+	case errMsg:
+		m.loading = false
+		m.err = msg
+
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "q", "ctrl+c", "esc":
+			return m, tea.Quit
+		case "up", "k":
+			m.moveCursor(-1)
+		case "down", "j":
+			m.moveCursor(1)
+		case "pgup", "ctrl+b":
+			m.moveCursor(-m.visibleRows())
+		case "pgdown", "ctrl+f", " ":
+			m.moveCursor(m.visibleRows())
+		case "home", "g":
+			m.moveCursor(-len(m.torrents))
+		case "end", "G":
+			m.moveCursor(len(m.torrents))
+		case "enter":
+			if len(m.torrents) > 0 {
+				m.highlighted[m.cursor] = !m.highlighted[m.cursor]
+			}
+		case "r":
+			m.loading = true
+			m.err = nil
+			m.highlighted = map[int]bool{}
+			return m, fetchTorrents(m.addr)
+		}
+	}
+	return m, nil
+}
+
+func (m model) View() string {
+	var b strings.Builder
+
+	title := fmt.Sprintf("Completed torrents (%d)", len(m.torrents))
+	if m.loading {
+		title = "Loading torrents…"
+	}
+	b.WriteString(titleStyle.Render(title) + "\n")
+
+	if m.err != nil {
+		b.WriteString(fmt.Sprintf("Error: %v\n", m.err))
+	}
+
+	end := min(m.offset+m.visibleRows(), len(m.torrents))
+	for i := m.offset; i < end; i++ {
+		name := m.torrents[i]
+		if m.width > 2 {
+			// Truncate so long names don't wrap and throw off scrolling.
+			name = ansi.Truncate(name, m.width-2, "…")
+		}
+		if m.highlighted[i] {
+			name = highlightedStyle.Render(name)
+		}
+		if i == m.cursor {
+			b.WriteString(cursorStyle.Render("> ") + name + "\n")
+		} else {
+			b.WriteString("  " + name + "\n")
+		}
+	}
+
+	b.WriteString(helpStyle.Render("↑/↓ move • enter highlight • r refresh • q quit"))
+	return b.String()
 }
 
 func main() {
 	addr := flag.String("addr", "localhost:1234", "rtorrent SCGI address")
 	flag.Parse()
 
-	res, err := call(*addr, "d.multicall2", "", "complete", "d.name=")
-	if err != nil {
+	m := model{addr: *addr, highlighted: map[int]bool{}, loading: true}
+	if _, err := tea.NewProgram(m, tea.WithAltScreen()).Run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
-	}
-	if res.Array == nil {
-		fmt.Fprintln(os.Stderr, "unexpected response: not an array")
-		os.Exit(1)
-	}
-
-	for _, row := range *res.Array {
-		if row.Array == nil || len(*row.Array) == 0 {
-			continue
-		}
-		fields := *row.Array
-		fmt.Printf("%s\n", fields[0].str())
 	}
 }
